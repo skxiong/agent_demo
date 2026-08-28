@@ -1,8 +1,6 @@
 import os
 import requests
-
-# 导入src读取.env函数
-from src.llm_factory import load_env_file
+from src.llm_factory import load_env_file, find_env_file # 导入src读取.env函数
 
 
 def chat_request(base_url: str, api_key: str, model_name: str, user_content: str, timeout=120):
@@ -50,10 +48,7 @@ def test_openai():
 
 
 if __name__ == "__main__":
-    tests_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(tests_dir)
-    env_path = os.path.join(project_root, "src", ".env")
-
+    env_path = find_env_file()
     load_env_file(env_path)
 
     test_ollama()

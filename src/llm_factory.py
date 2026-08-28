@@ -2,11 +2,35 @@ import os
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 
+def find_env_file():
+    """
+    查找.env文件
+    1. 优先：当前脚本运行工作目录下查找 .env
+    2. 没找到：向上一层，项目根目录（tests上级）查找 .env
+    返回.env绝对路径；找不到返回None
+    """
+    # 1. 当前工作目录
+    cwd_env = os.path.join(os.getcwd(), ".env")
+    if os.path.isfile(cwd_env):
+        return cwd_env
+
+    # 2. 当前脚本所在tests目录，往上到项目根目录
+    tests_file = os.path.abspath(__file__)
+    tests_dir = os.path.dirname(tests_file)
+    project_root = os.path.dirname(tests_dir)
+    project_env = os.path.join(project_root, "src", ".env")
+    if os.path.isfile(project_env):
+        return project_env
+
+    return None
 
 def load_env_file(env_path: str = ".env") -> None:
     """手动解析.env，写入进程环境变量，不依赖python‑dotenv"""
     if not os.path.exists(env_path):
-        return
+        env_path = find_env_file()
+    if not os.path.exists(env_path):
+        return None
+    
     with open(env_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
