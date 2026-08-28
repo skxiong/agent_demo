@@ -21,7 +21,8 @@ def chat_request(base_url: str, api_key: str, model_name: str, user_content: str
 
 def test_ollama():
     print("=== Test Ollama ===")
-    base_url = os.getenv("OLLAMA_BASE_URL")
+    raw_base_url = os.getenv("OLLAMA_BASE_URL")
+    base_url = raw_base_url.rstrip("/") + "/v1"
     model = os.getenv("OLLAMA_MODEL")
     api_key = os.getenv("OLLAMA_API_KEY", "dummy")
 
@@ -52,4 +53,4 @@ if __name__ == "__main__":
     load_env_file(env_path)
 
     test_ollama()
-    # test_openai()
+    test_openai()

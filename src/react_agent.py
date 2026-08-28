@@ -1,23 +1,19 @@
 import re
 from langchain_core.tools import BaseTool
 
-REACT_PROMPT_TEMPLATE = """
-你是ReAct智能助手，可以使用工具解决问题。
-可用工具列表：
-{tool_descriptions}
+REACT_PROMPT_TEMPLATE = """ 
+你是ReAct智能助手，可以使用工具解决问题。 可用工具列表： {tool_descriptions}  
 
 严格输出格式：
 Thought: 你的思考
 Action: 工具名称
-Action Input: 工具入参
+Action Input: 工具入参  
 
 当得到最终答案时，输出：
-Final Answer: 你的最终回答
+Final Answer: 你的最终回答  
 
-历史上下文：
-{history}
-
-用户问题：{query}
+历史上下文： {history}  
+用户问题：{query} 
 """
 
 
@@ -64,6 +60,7 @@ class HandWriteReActAgent:
                 query=query
             )
             resp = self.llm.invoke(prompt)
+            print(f"resp: {resp}")
             raw_out = resp.content
             print(f"\n==== Step {step+1} LLM Output ====\n{raw_out}\n")
 
