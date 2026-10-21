@@ -46,6 +46,7 @@ import yaml
 # ========== LangChain / LangGraph ==========
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool, StructuredTool
+from langchain_core.callbacks import BaseCallbackHandler
 from langgraph.prebuilt import create_react_agent
 
 # LangFuse 导入
@@ -206,6 +207,18 @@ agent = create_react_agent(
 
 # ==================== LangFuse 追踪（核心） ====================
 
+class ToolPrintHandler(BaseCallbackHandler):
+    """把智能体实际调用的工具（含技能工具）打印到控制台。"""
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        name = (serialized or {}).get("name", "?")
+        print(f"  [工具调用] {name}  参数: {input_str}")
+
+    def on_tool_end(self, output, **kwargs):
+        text = getattr(output, "content", output)
+        print(f"  [工具返回] {text}")
+
+
 @observe(name="react_agent_invoke", as_type="chain")
 def run_agent(
     question: str,
@@ -228,11 +241,11 @@ def run_agent(
     if metadata:
         get_client().update_current_span(metadata=metadata)
 
-    # CallbackHandler 会自动追踪 LangGraph 内部的 LLM 与工具调用
+    # CallbackHandler 自动追踪 LLM/工具调用；ToolPrintHandler 打印每次工具调用
     handler = CallbackHandler()
     result = agent.invoke(
         {"messages": [{"role": "user", "content": question}]},
-        config={"callbacks": [handler]},
+        config={"callbacks": [handler, ToolPrintHandler()]},
     )
     return result["messages"][-1].content
 
