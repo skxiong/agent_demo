@@ -42,9 +42,18 @@ from langgraph.graph import StateGraph, END
 # LangFuse 导入
 from langfuse import observe, get_client
 
-os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-xxx"
-os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-xxx"
-os.environ["LANGFUSE_BASE_URL"] = "http://ip:3000"
+# 从当前文件同级目录的 .env 读取配置到环境变量
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path, encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _key, _, _val = _line.partition("=")
+            _key = _key.strip()
+            _val = _val.strip().strip('"').strip("'")
+            os.environ.setdefault(_key, _val)
 
 # 抑制 OpenTelemetry 网络超时日志
 logging.getLogger("opentelemetry").setLevel(logging.CRITICAL)
@@ -58,8 +67,8 @@ LANGFUSE_ENABLED = bool(
 # 使用 ChatOpenAI，可兼容 OpenAI / 通义 / DeepSeek 等 OpenAI‑兼容接口
 llm = ChatOpenAI(
     model="qwen3.8-27b",
-    api_key="sk-xxxxx",
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
     temperature=0,
 )
 
@@ -88,7 +97,7 @@ def summarize(text: str) -> str:
 
 @observe()
 def qa(question: str) -> str:
-    return call_llm(f"请用一句话回答：{question}")
+    return call_llm("写一篇500字的作文")
 
 
 @observe(name="multi_tool_agent")
