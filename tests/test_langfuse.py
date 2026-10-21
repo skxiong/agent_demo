@@ -1,28 +1,29 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-""" LangGraph + LangFuse 集成演示
-LangFuse 基于 OpenTelemetry 架构，提供两种追踪方式：
+""" 简单的 ReAct 智能体 + LangFuse 监控演示
 
-方式1（推荐）：@observe 装饰器
-  - 最简洁，直接修饰函数
-  - 自动追踪函数内的所有 LLM 调用
-  - 支持嵌套：被装饰的函数互相调用时，自动形成父子 span
+ReAct 范式：Reasoning + Acting
+  - LLM 先进行推理（Thought），决定是否需要调用工具（Action）
+  - 调用工具后拿到观察结果（Observation），再继续推理
+  - 直到 LLM 认为可以直接给出最终答案（Final Answer）
 
-方式2：@observe + OTEL span 属性
-  - 适用于需要动态传入 user_id / session_id / tags 的场景
-  - 通过 OpenTelemetry span 属性注入用户上下文
+本文件用 LangGraph 的 create_react_agent 构建一个最简 ReAct 智能体，
+并通过 LangFuse 记录整条链路：Agent 节点、LLM generation、Tool 调用。
 
-环境变量配置（Windows PowerShell）：
-  $env:OPENAI_API_KEY="sk-xxx"
-  $env:OPENAI_BASE_URL="https://api.openai.com/v1"
-  $env:LANGFUSE_PUBLIC_KEY="pk-lf-xxx"
-  $env:LANGFUSE_SECRET_KEY="sk-lf-xxx"
-  $env:LANGFUSE_BASE_URL="http://172.31.234.9:3000"
+LangFuse 追踪方式：
+  - @observe 装饰器：把整次 agent 调用包装成一个 chain span
+  - langfuse.langchain.CallbackHandler：自动追踪 LangGraph 内部的
+    LLM 调用与工具调用，并挂载到当前 @observe 的 trace 上
+  - OpenTelemetry span 属性：注入 user_id / session_id / tags
+
+环境变量配置（Windows PowerShell），或写入同目录 .env：
+  OPENAI_API_KEY / OPENAI_BASE_URL
+  LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL
 """
 import os
 import uuid
 import logging
-from typing import TypedDict, Optional
+from typing import Optional
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -33,14 +34,14 @@ for attr in ('verbose', 'debug', 'llm_cache'):
     if not hasattr(langchain, attr):
         setattr(langchain, attr, False if attr != 'llm_cache' else None)
 
-# ========== 替换为 langchain_openai ==========
+# ========== LangChain / LangGraph ==========
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langgraph.graph import StateGraph, END
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
 
 # LangFuse 导入
 from langfuse import observe, get_client
+from langfuse.langchain import CallbackHandler
 
 # 从当前文件同级目录的 .env 读取配置到环境变量
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -72,116 +73,109 @@ llm = ChatOpenAI(
     temperature=0,
 )
 
-# ====== 方式1：@observe 装饰器（推荐） ======
 
-@observe(as_type="generation")
-def call_llm(prompt_text: str, model_name: str = "gpt-3.5-turbo") -> str:
-    prompt = ChatPromptTemplate.from_template("{text}")
-    chain = prompt | llm | StrOutputParser()
-    result = chain.invoke({"text": prompt_text})
-    get_client().update_current_generation(
-        model=model_name, input=prompt_text, output=result,
-    )
-    return result
+# ==================== 工具（Acting） ====================
 
-
-@observe()
-def translate(text: str) -> str:
-    return call_llm(f"请将以下内容翻译成英文，只返回译文：\n{text}")
+@tool
+def calculator(expression: str) -> str:
+    """计算数学表达式，例如 '2 + 3 * 4'。"""
+    try:
+        return str(eval(expression, {"__builtins__": {}}, {}))
+    except Exception as exc:  # noqa: BLE001
+        return f"计算失败: {exc}"
 
 
-@observe()
-def summarize(text: str) -> str:
-    return call_llm(f"请用一句话总结以下内容：\n{text}")
+@tool
+def get_weather(city: str) -> str:
+    """查询指定城市的当前天气（示例数据）。"""
+    mock = {"北京": "晴，25°C", "上海": "多云，28°C", "深圳": "阵雨，30°C"}
+    return mock.get(city, f"{city}：暂无数据（示例）")
 
 
-@observe()
-def qa(question: str) -> str:
-    return call_llm("写一篇500字的作文")
+@tool
+def word_count(text: str) -> str:
+    """统计文本的字符数。"""
+    return f"字符数: {len(text)}"
 
 
-@observe(name="multi_tool_agent")
-def agent_entry(user_input: str):
-    answer = qa(user_input)
-    summary = summarize(answer)
-    translated = translate(summary)
-    return {"answer": answer, "summary": summary, "translated": translated}
+TOOLS = [calculator, get_weather, word_count]
+
+SYSTEM_PROMPT = (
+    "你是一个 ReAct 智能体。请先思考（Thought），再决定是否需要调用工具（Action）。"
+    "可用工具：calculator（数学计算）、get_weather（查询天气）、word_count（统计字符数）。"
+    "拿到工具结果（Observation）后继续推理，直到可以直接给出最终答案（Final Answer）。"
+)
+
+# ==================== 构建 ReAct 智能体 ====================
+
+agent = create_react_agent(
+    llm,
+    TOOLS,
+    prompt=SYSTEM_PROMPT,
+    name="react_agent",
+)
 
 
-# ====== 方式2：@observe + 动态设置 trace 属性 ======
+# ==================== LangFuse 追踪（核心） ====================
 
-class State(TypedDict):
-    question: str
-    answer: Optional[str]
-
-
-def chat_node(state: State) -> dict:
-    answer = call_llm(f"请用一句话回答：{state['question']}")
-    return {"answer": answer}
-
-
-def build_graph():
-    graph = StateGraph(State)
-    graph.add_node("chat", chat_node)
-    graph.set_entry_point("chat")
-    graph.add_edge("chat", END)
-    return graph.compile()
-
-
-@observe(as_type="chain")
-def traced_graph_invoke(question, user_id, session_id, tags=None, metadata=None):
+@observe(name="react_agent_invoke", as_type="chain")
+def run_agent(
+    question: str,
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    tags: Optional[list] = None,
+    metadata: Optional[dict] = None,
+) -> str:
+    """调用 ReAct 智能体，并通过 LangFuse 记录整条 ReAct 链路。"""
+    # 通过 OpenTelemetry span 属性注入用户上下文
     from opentelemetry import trace as otel_trace
     span = otel_trace.get_current_span()
     if span.is_recording():
-        span.set_attribute("langfuse.user.id", user_id)
-        span.set_attribute("langfuse.session.id", session_id)
+        if user_id:
+            span.set_attribute("langfuse.user.id", user_id)
+        if session_id:
+            span.set_attribute("langfuse.session.id", session_id)
         if tags:
             span.set_attribute("langfuse.tags", tags)
     if metadata:
         get_client().update_current_span(metadata=metadata)
-    app = build_graph()
-    return app.invoke({"question": question})
+
+    # CallbackHandler 会自动追踪 LangGraph 内部的 LLM 与工具调用
+    handler = CallbackHandler()
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": question}]},
+        config={"callbacks": [handler]},
+    )
+    return result["messages"][-1].content
 
 
-# ====== 运行演示 ======
+# ==================== 运行演示 ====================
 
-def demo_observe_decorator():
+def demo_react_agent():
     print("\n" + "=" * 60)
-    print("方式1：@observe 装饰器")
-    print("=" * 60)
-    result = agent_entry("什么是大语言模型？")
-    print(f"  回答: {result['answer']}")
-    print(f"  摘要: {result['summary']}")
-    print(f"  译文: {result['translated']}")
-
-
-def demo_observe_with_context():
-    print("\n" + "=" * 60)
-    print("方式2：@observe + 动态上下文")
+    print("ReAct 智能体演示（LangFuse 追踪）")
     print("=" * 60)
     session_id = f"session-{uuid.uuid4().hex[:8]}"
     questions = [
-        ("user_001", "什么是 Python？"),
-        ("user_001", "它和 Java 有什么区别？"),
-        ("user_002", "推荐一个入门编程语言"),
+        ("user_001", "北京现在的天气怎么样？"),
+        ("user_001", "帮我算一下 (12 + 8) * 3 等于多少"),
+        ("user_002", '"Langfuse" 这个词有多少个字符？'),
     ]
     for user_id, question in questions:
         print(f"\n  [{user_id}] {question}")
-        result = traced_graph_invoke(
-            question=question, user_id=user_id,
+        answer = run_agent(
+            question=question,
+            user_id=user_id,
             session_id=session_id,
-            tags=["langgraph", "multi-turn"],
+            tags=["react", "langgraph"],
             metadata={"app_version": "1.0.0"},
         )
-        print(f"  助手: {result['answer']}")
-    if LANGFUSE_ENABLED:
-        get_client().flush()
+        print(f"  助手: {answer}")
 
 
 if __name__ == "__main__":
     print(f"LangFuse: {'已启用' if LANGFUSE_ENABLED else '未配置（跳过追踪）'}")
-    demo_observe_decorator()
-    demo_observe_with_context()
+    demo_react_agent()
     if LANGFUSE_ENABLED:
         get_client().flush()
-    print("\n运行完毕。在 LangFuse 控制台可查看追踪数据。")
+    print("\n运行完毕。在 LangFuse 控制台可查看 ReAct 链路的追踪数据。")
