@@ -10,6 +10,13 @@ ReAct 范式：Reasoning + Acting
 本文件用 LangGraph 的 create_react_agent 构建一个最简 ReAct 智能体，
 并通过 LangFuse 记录整条链路：Agent 节点、LLM generation、Tool 调用。
 
+Skill（技能）支持：
+  - 从同级 skill 目录读取 <skill>/SKILL.md（YAML frontmatter: name/description）
+  - 每个技能注册为一个工具，description 用于匹配用户问题
+  - 当用户问题与某技能描述相似时，智能体先调用该技能工具获取步骤，
+    再严格按步骤依次执行（示例技能 tool_calling 会依次调用
+    calculator -> get_weather -> word_count）
+
 LangFuse 追踪方式：
   - @observe 装饰器：把整次 agent 调用包装成一个 chain span
   - langfuse.langchain.CallbackHandler：自动追踪 LangGraph 内部的
@@ -34,9 +41,11 @@ for attr in ('verbose', 'debug', 'llm_cache'):
     if not hasattr(langchain, attr):
         setattr(langchain, attr, False if attr != 'llm_cache' else None)
 
+import yaml
+
 # ========== LangChain / LangGraph ==========
 from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
+from langchain_core.tools import tool, StructuredTool
 from langgraph.prebuilt import create_react_agent
 
 # LangFuse 导入
@@ -103,15 +112,86 @@ def word_count(text: str) -> str:
 
 TOOLS = [calculator, get_weather, word_count]
 
+
+# ==================== Skill 加载（读取同级 skill 目录） ====================
+
+SKILL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skill")
+
+
+def _parse_skill_md(text: str):
+    """解析 SKILL.md 的 YAML frontmatter 与正文。"""
+    meta, body = {}, text.strip()
+    stripped = text.lstrip()
+    if stripped.startswith("---"):
+        _, _, rest = stripped.partition("---")
+        front, sep, body_text = rest.partition("---")
+        if sep:
+            meta = yaml.safe_load(front) or {}
+            body = body_text.strip()
+    return meta, body
+
+
+def load_skills(skill_root: str):
+    """扫描 skill 目录，读取每个 <skill>/SKILL.md。"""
+    skills = []
+    if not os.path.isdir(skill_root):
+        return skills
+    for entry in sorted(os.listdir(skill_root)):
+        skill_dir = os.path.join(skill_root, entry)
+        md_path = os.path.join(skill_dir, "SKILL.md")
+        if os.path.isdir(skill_dir) and os.path.isfile(md_path):
+            with open(md_path, encoding="utf-8") as f:
+                meta, body = _parse_skill_md(f.read())
+            skills.append({
+                "name": meta.get("name") or entry,
+                "description": (meta.get("description") or "").strip(),
+                "body": body,
+                "path": md_path,
+            })
+    return skills
+
+
+SKILLS = load_skills(SKILL_DIR)
+
+
+def _make_skill_tool(skill: dict) -> StructuredTool:
+    """把一个 skill 变成一个工具：description 用于匹配，调用后返回技能步骤。"""
+
+    def _load(task: str = "") -> str:
+        return skill["body"]
+
+    return StructuredTool.from_function(
+        func=_load,
+        name=f"skill_{skill['name']}",
+        description=(
+            f"[技能] {skill['description']} "
+            "当用户问题与上述描述相似时调用本技能，返回的技能步骤需要严格按顺序执行。"
+        ),
+    )
+
+
+SKILL_TOOLS = [_make_skill_tool(s) for s in SKILLS]
+
+# 智能体可用的全部工具 = 基础工具 + 技能工具
+TOOLS = TOOLS + SKILL_TOOLS
+
+_SKILL_CATALOG = "\n".join(
+    f"   - {s['name']}（skill_{s['name']}）：{s['description']}" for s in SKILLS
+) or "   （当前没有可用技能）"
+
 SYSTEM_PROMPT = (
     "你是一个 ReAct 智能体，必须遵循以下规则：\n"
     "1. 先思考（Thought），再决定是否调用工具（Action）。\n"
-    "2. 只要用户的问题涉及以下任一能力，就必须调用对应工具，禁止凭记忆直接作答：\n"
-    "   - 数学计算（加减乘除、括号、数值运算）-> calculator\n"
+    "2. 你的首要任务是匹配「技能（Skill）」。只要用户问题与某个技能的描述相似"
+    "（例如涉及该技能覆盖的能力，如数学计算 / 城市天气查询 / 文本字符统计），"
+    "就必须先调用对应的 skill_<name> 工具获取技能步骤，然后严格按步骤依次执行。\n"
+    f"可用技能：\n{_SKILL_CATALOG}\n"
+    "3. 仅当没有任何技能匹配时，才直接调用基础工具：\n"
+    "   - 数学计算 -> calculator\n"
     "   - 查询城市天气 / 气温 / 是否下雨 -> get_weather\n"
     "   - 统计文本字符数 / 字数 / 长度 -> word_count\n"
-    "3. 调用工具后根据返回结果（Observation）继续推理。\n"
-    "4. 当可以确定答案时，输出最终答案（Final Answer）。"
+    "4. 调用工具后根据返回结果（Observation）继续推理。\n"
+    "5. 当可以确定答案时，输出最终答案（Final Answer）。"
 )
 
 # ==================== 构建 ReAct 智能体 ====================
@@ -164,7 +244,10 @@ def demo_react_agent():
     print("ReAct 智能体演示（LangFuse 追踪）")
     print("=" * 60)
     print("请输入你的问题，ReAct 智能体会调用工具作答。")
-    print("输入 exit / quit 或直接回车退出，任何时候按 Ctrl+C 也可退出。\n")
+    print("输入 exit / quit 或直接回车退出，任何时候按 Ctrl+C 也可退出。")
+    if SKILLS:
+        print("已加载技能: " + ", ".join(s["name"] for s in SKILLS))
+    print()
 
     session_id = f"session-{uuid.uuid4().hex[:8]}"
     user_id = "cli_user"
