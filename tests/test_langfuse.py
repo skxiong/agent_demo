@@ -78,7 +78,8 @@ llm = ChatOpenAI(
 
 @tool
 def calculator(expression: str) -> str:
-    """计算数学表达式，例如 '2 + 3 * 4'。"""
+    """数学计算工具。当用户需要做加、减、乘、除、括号等算术或数值计算时使用。
+    入参 expression 为数学表达式字符串，例如 '(12 + 8) * 3'。"""
     try:
         return str(eval(expression, {"__builtins__": {}}, {}))
     except Exception as exc:  # noqa: BLE001
@@ -87,23 +88,30 @@ def calculator(expression: str) -> str:
 
 @tool
 def get_weather(city: str) -> str:
-    """查询指定城市的当前天气（示例数据）。"""
+    """天气查询工具。当用户询问某个城市当前的天气、气温、是否下雨等时使用。
+    入参 city 为城市名，例如 '北京'。"""
     mock = {"北京": "晴，25°C", "上海": "多云，28°C", "深圳": "阵雨，30°C"}
     return mock.get(city, f"{city}：暂无数据（示例）")
 
 
 @tool
 def word_count(text: str) -> str:
-    """统计文本的字符数。"""
+    """字符统计工具。当用户询问某段文本的字符数、字数或长度时使用。
+    入参 text 为待统计的文本。"""
     return f"字符数: {len(text)}"
 
 
 TOOLS = [calculator, get_weather, word_count]
 
 SYSTEM_PROMPT = (
-    "你是一个 ReAct 智能体。请先思考（Thought），再决定是否需要调用工具（Action）。"
-    "可用工具：calculator（数学计算）、get_weather（查询天气）、word_count（统计字符数）。"
-    "拿到工具结果（Observation）后继续推理，直到可以直接给出最终答案（Final Answer）。"
+    "你是一个 ReAct 智能体，必须遵循以下规则：\n"
+    "1. 先思考（Thought），再决定是否调用工具（Action）。\n"
+    "2. 只要用户的问题涉及以下任一能力，就必须调用对应工具，禁止凭记忆直接作答：\n"
+    "   - 数学计算（加减乘除、括号、数值运算）-> calculator\n"
+    "   - 查询城市天气 / 气温 / 是否下雨 -> get_weather\n"
+    "   - 统计文本字符数 / 字数 / 长度 -> word_count\n"
+    "3. 调用工具后根据返回结果（Observation）继续推理。\n"
+    "4. 当可以确定答案时，输出最终答案（Final Answer）。"
 )
 
 # ==================== 构建 ReAct 智能体 ====================
@@ -155,27 +163,43 @@ def demo_react_agent():
     print("\n" + "=" * 60)
     print("ReAct 智能体演示（LangFuse 追踪）")
     print("=" * 60)
+    print("请输入你的问题，ReAct 智能体会调用工具作答。")
+    print("输入 exit / quit 或直接回车退出，任何时候按 Ctrl+C 也可退出。\n")
+
     session_id = f"session-{uuid.uuid4().hex[:8]}"
-    questions = [
-        ("user_001", "北京现在的天气怎么样？"),
-        ("user_001", "帮我算一下 (12 + 8) * 3 等于多少"),
-        ("user_002", '"Langfuse" 这个词有多少个字符？'),
-    ]
-    for user_id, question in questions:
-        print(f"\n  [{user_id}] {question}")
-        answer = run_agent(
-            question=question,
-            user_id=user_id,
-            session_id=session_id,
-            tags=["react", "langgraph"],
-            metadata={"app_version": "1.0.0"},
-        )
-        print(f"  助手: {answer}")
+    user_id = "cli_user"
+
+    try:
+        while True:
+            try:
+                question = input("你: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            if not question or question.lower() in ("exit", "quit"):
+                break
+
+            try:
+                answer = run_agent(
+                    question=question,
+                    user_id=user_id,
+                    session_id=session_id,
+                    tags=["react", "langgraph", "cli"],
+                    metadata={"app_version": "1.0.0"},
+                )
+            except KeyboardInterrupt:
+                print("\n[已中断当前对话]")
+                break
+
+            print(f"助手: {answer}\n")
+    finally:
+        if LANGFUSE_ENABLED:
+            get_client().flush()
+        print("\n对话已结束，再见！")
 
 
 if __name__ == "__main__":
     print(f"LangFuse: {'已启用' if LANGFUSE_ENABLED else '未配置（跳过追踪）'}")
     demo_react_agent()
-    if LANGFUSE_ENABLED:
-        get_client().flush()
     print("\n运行完毕。在 LangFuse 控制台可查看 ReAct 链路的追踪数据。")
