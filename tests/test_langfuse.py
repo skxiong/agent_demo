@@ -46,7 +46,6 @@ import yaml
 # ========== LangChain / LangGraph ==========
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool, StructuredTool
-from langchain_core.callbacks import BaseCallbackHandler
 from langgraph.prebuilt import create_react_agent
 
 # LangFuse 导入
@@ -274,16 +273,21 @@ agent = create_react_agent(
 
 # ==================== LangFuse 追踪（核心） ====================
 
-class ToolPrintHandler(BaseCallbackHandler):
-    """把智能体实际调用的工具（含技能工具）打印到控制台。"""
-
-    def on_tool_start(self, serialized, input_str, **kwargs):
-        name = (serialized or {}).get("name", "?")
-        print(f"  [工具调用] {name}  参数: {input_str}")
-
-    def on_tool_end(self, output, **kwargs):
-        text = getattr(output, "content", output)
-        print(f"  [工具返回] {text}")
+def _print_message(msg) -> None:
+    """按消息类型打印：模型交互内容 / 模型决策(工具或命令) / 工具调用 / 工具返回。"""
+    kind = type(msg).__name__
+    if kind == "AIMessage":
+        content = getattr(msg, "content", "")
+        if content:
+            print(f"[模型] {content}")
+        for call in (getattr(msg, "tool_calls", None) or []):
+            name = call["name"]
+            args = call.get("args", {})
+            # 模型决定要调用的工具 / 要执行的命令
+            print(f"[模型] 决定调用工具 {name}，参数: {args}")
+            print(f"[工具调用] {name}  参数: {args}")
+    elif kind == "ToolMessage":
+        print(f"[工具返回] {msg.name}: {msg.content}")
 
 
 @observe(name="react_agent_invoke", as_type="chain")
@@ -294,7 +298,14 @@ def run_agent(
     tags: Optional[list] = None,
     metadata: Optional[dict] = None,
 ) -> str:
-    """调用 ReAct 智能体，并通过 LangFuse 记录整条 ReAct 链路。"""
+    """调用 ReAct 智能体，并通过 LangFuse 记录整条 ReAct 链路。
+
+    使用 stream(values) 逐条消费消息，从而严格按时间顺序打印：
+      [模型] Agent 与模型的交互内容
+      [模型] 决定调用工具 / 执行命令（模型决策）
+      [工具调用] 调用了什么工具
+      [工具返回] 工具返回了什么
+    """
     # 通过 OpenTelemetry span 属性注入用户上下文
     from opentelemetry import trace as otel_trace
     span = otel_trace.get_current_span()
@@ -308,13 +319,21 @@ def run_agent(
     if metadata:
         get_client().update_current_span(metadata=metadata)
 
-    # CallbackHandler 自动追踪 LLM/工具调用；ToolPrintHandler 打印每次工具调用
     handler = CallbackHandler()
-    result = agent.invoke(
+    printed = 0
+    final_state = None
+    for state in agent.stream(
         {"messages": [{"role": "user", "content": question}]},
-        config={"callbacks": [handler, ToolPrintHandler()]},
-    )
-    return result["messages"][-1].content
+        config={"callbacks": [handler]},
+        stream_mode="values",
+    ):
+        messages = state["messages"]
+        for msg in messages[printed:]:
+            _print_message(msg)
+        printed = len(messages)
+        final_state = state
+
+    return final_state["messages"][-1].content
 
 
 # ==================== 运行演示 ====================
