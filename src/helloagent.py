@@ -23,6 +23,11 @@ Skill（技能）支持：
   - 主 Agent 调用 task(description, subagent_type) 即可开启子 Agent
   - 子 Agent 执行链路同样由 LangFuse 记录
 
+危险命令确认（Human-in-the-loop）：
+  - run_command 工具执行 Shell 命令
+  - 命中 rm / chown / chmod / dd / mkfs / kill / shutdown 等危险模式时，
+    先向用户确认（y 同意 / 其它拒绝），用户同意才真正执行
+
 LangFuse 追踪方式：
   - @observe 装饰器：把整次 agent 调用包装成一个 chain span
   - langfuse.langchain.CallbackHandler：自动追踪 LangGraph 内部的
@@ -34,8 +39,10 @@ LangFuse 追踪方式：
   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL
 """
 import os
+import re
 import uuid
 import logging
+import subprocess
 from typing import Optional
 
 import warnings
@@ -183,7 +190,77 @@ def word_count(text: str) -> str:
     return f"字符数: {len(text)}"
 
 
-BASE_TOOLS = [calculator, get_weather, recommend_attractions, recommend_food, word_count]
+# ==================== Shell 命令 + 危险命令确认 ====================
+
+# 命中即视为危险命令，需向用户确认后才可执行
+DANGEROUS_COMMAND_PATTERNS = [
+    r"\brm\b",        # 删除文件/目录
+    r"\brmdir\b",
+    r"\bchown\b",     # 修改属主
+    r"\bchmod\b",     # 修改权限
+    r"\bmkfs\b",      # 格式化
+    r"\bdd\b",        # 磁盘写入
+    r"\bmv\b",        # 移动/覆盖
+    r"\bshutdown\b",
+    r"\breboot\b",
+    r"\bkill\b",
+    r"\bkillall\b",
+    r"\bformat\b",
+    r"\bdel\b",
+    r"\breg\s+delete\b",
+    r">\s*/dev/",
+    r":\(\)\s*\{",    # fork bomb
+]
+
+
+def _match_dangerous_command(command: str) -> Optional[str]:
+    """若命令命中危险模式，返回命中的模式，否则返回 None。"""
+    for pattern in DANGEROUS_COMMAND_PATTERNS:
+        if re.search(pattern, command):
+            return pattern
+    return None
+
+
+def _confirm_dangerous_command(command: str, pattern: str) -> bool:
+    """危险命令确认：用户输入 y/yes 表示同意执行，其它视为拒绝。"""
+    print(f"\n⚠  [危险命令] 检测到疑似危险操作（匹配 {pattern}）：")
+    print(f"     {command}")
+    try:
+        answer = input("     是否执行？同意请输入 y，拒绝直接回车 (y/N): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    approved = answer in ("y", "yes")
+    print(f"     [危险命令] 用户{'已同意' if approved else '已拒绝'}执行。")
+    return approved
+
+
+@tool
+def run_command(command: str) -> str:
+    """执行 Shell 命令并返回输出（stdout/stderr 与退出码）。
+    对于危险命令（如 rm、chown、chmod、dd、mkfs、kill、shutdown 等），
+    会先向用户确认：用户同意才执行，拒绝则取消。入参 command 为要执行的命令。"""
+    pattern = _match_dangerous_command(command)
+    if pattern and not _confirm_dangerous_command(command, pattern):
+        return f"用户拒绝执行危险命令，已取消: {command}"
+
+    try:
+        proc = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return f"命令执行超时（>60s）: {command}"
+    except Exception as exc:  # noqa: BLE001
+        return f"命令执行失败: {exc}"
+
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return f"exit_code={proc.returncode}\n{output[:2000]}"
+
+
+BASE_TOOLS = [
+    calculator, get_weather, recommend_attractions, recommend_food,
+    word_count, run_command,
+]
 
 
 # ==================== 消息打印（严格按时间顺序） ====================
@@ -303,11 +380,14 @@ SYSTEM_PROMPT = (
     "   - 推荐城市旅游景点 -> recommend_attractions\n"
     "   - 推荐城市美食 / 小吃 -> recommend_food\n"
     "   - 统计文本字符数 / 字数 / 长度 -> word_count\n"
+    "   - 执行 Shell 命令 -> run_command（危险命令如 rm / chown 会先向用户确认）\n"
     "4. 调用工具后根据返回结果（Observation）继续推理。\n"
     "5. 你还可以开启子 Agent（deepagents 能力）：当任务可拆分为独立子任务、"
     "或某部分需要专门处理时，调用 task(description=\"...\", subagent_type=\"research\") "
     "由子 Agent 完成子任务并返回结论。\n"
-    "6. 当可以确定答案时，输出最终答案（Final Answer）。"
+    "6. 涉及 rm / chown / chmod / dd / mkfs / kill / shutdown 等危险命令时，"
+    "必须通过 run_command 执行，运行时系统会向用户确认，用户可同意或拒绝。\n"
+    "7. 当可以确定答案时，输出最终答案（Final Answer）。"
 )
 
 # ==================== 构建 ReAct 智能体（deepagents） ====================
