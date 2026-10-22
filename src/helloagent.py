@@ -10,6 +10,13 @@ ReAct 范式：Reasoning + Acting
 本文件用 deepagents 的 create_deep_agent 构建一个 ReAct 智能体（LangGraph 之上），
 并通过 LangFuse 记录整条链路：Agent 节点、LLM generation、Tool 调用。
 
+模块拆分：
+  - tool.py      : 基础工具（calculator / get_weather / recommend_attractions /
+                   recommend_food / word_count）与 BASE_TOOLS
+  - dangerous.py : Shell 命令执行 run_command 与危险命令拦截、用户确认
+  - subagent.py  : 基于 deepagents 的子 Agent 定义（DEEP_SUBAGENTS）
+  - helloagent.py: 本文件，配置 / 技能加载 / 组装 Agent / LangFuse 追踪 / CLI
+
 Skill（技能）支持：
   - 从项目根目录的 skill 目录读取 <skill>/SKILL.md（YAML frontmatter: name/description）
   - 每个技能注册为一个工具，description 用于匹配用户问题
@@ -39,10 +46,9 @@ LangFuse 追踪方式：
   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL
 """
 import os
-import re
+import sys
 import uuid
 import logging
-import subprocess
 from typing import Optional
 
 import warnings
@@ -54,19 +60,25 @@ for attr in ('verbose', 'debug', 'llm_cache'):
     if not hasattr(langchain, attr):
         setattr(langchain, attr, False if attr != 'llm_cache' else None)
 
+# 项目根目录（src 的上一级，即 agent_demo）；加入 sys.path 以便导入 src 包
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import yaml
 
 # ========== LangChain / LangGraph / deepagents ==========
 from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool, StructuredTool
-from deepagents import create_deep_agent, SubAgent
+from langchain_core.tools import StructuredTool
+from deepagents import create_deep_agent
 
 # LangFuse 导入
 from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
 
-# 项目根目录（src 的上一级，即 agent_demo）
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 本项目拆分出的模块
+from src.tool import BASE_TOOLS
+from src.subagent import DEEP_SUBAGENTS
 
 # 从项目根目录的 .env 读取配置到环境变量
 _env_path = os.path.join(PROJECT_ROOT, ".env")
@@ -102,165 +114,9 @@ llm = ChatOpenAI(
 )
 
 
-# ==================== 工具（Acting） ====================
-
-@tool
-def calculator(expression: str) -> str:
-    """数学计算工具。当用户需要做加、减、乘、除、括号等算术或数值计算时使用。
-    入参 expression 为数学表达式字符串，例如 '(12 + 8) * 3'。"""
-    try:
-        return str(eval(expression, {"__builtins__": {}}, {}))
-    except Exception as exc:  # noqa: BLE001
-        return f"计算失败: {exc}"
-
-
-@tool
-def get_weather(city: str) -> str:
-    """天气查询工具。当用户询问某个城市当前的天气、气温、是否下雨等时使用。
-    入参 city 为城市名，例如 '北京'。"""
-    mock = {
-        "北京": "晴，25°C",
-        "上海": "多云，28°C",
-        "广州": "雷阵雨，31°C",
-        "深圳": "阵雨，30°C",
-        "杭州": "多云，27°C",
-        "成都": "阴，24°C",
-        "重庆": "小雨，26°C",
-        "武汉": "晴，29°C",
-        "西安": "晴，23°C",
-        "南京": "多云，26°C",
-        "天津": "晴，24°C",
-        "苏州": "阴，26°C",
-        "长沙": "小雨，28°C",
-        "青岛": "海雾，22°C",
-    }
-    return mock.get(city, f"{city}：暂无数据（示例）")
-
-
-@tool
-def recommend_attractions(city: str) -> str:
-    """旅游景点推荐工具。当用户想了解某个城市值得游玩的景点时使用。
-    入参 city 为城市名，例如 '上海'。"""
-    mock = {
-        "北京": "故宫、八达岭长城、颐和园、天坛、圆明园、南锣鼓巷",
-        "上海": "外滩、东方明珠、豫园、上海迪士尼、南京路步行街、田子坊",
-        "广州": "广州塔、沙面岛、白云山、陈家祠、长隆欢乐世界、越秀公园",
-        "深圳": "世界之窗、欢乐谷、深圳湾公园、大梅沙、东部华侨城、莲花山公园",
-        "杭州": "西湖、灵隐寺、西溪湿地、雷峰塔、千岛湖、宋城",
-        "成都": "宽窄巷子、锦里、大熊猫繁育研究基地、武侯祠、都江堰、青城山",
-        "重庆": "洪崖洞、解放碑、磁器口、长江索道、武隆天生三桥、鹅岭二厂",
-        "武汉": "黄鹤楼、东湖、户部巷、武汉大学、木兰天池、江汉路步行街",
-        "西安": "秦始皇兵马俑、大雁塔、西安城墙、回民街、华清宫、大唐不夜城",
-        "南京": "中山陵、夫子庙、总统府、玄武湖、明孝陵、鸡鸣寺",
-        "天津": "天津之眼、五大道、意大利风情街、古文化街、盘山、海河",
-        "苏州": "拙政园、虎丘、平江路、周庄、寒山寺、金鸡湖",
-        "长沙": "橘子洲、岳麓山、太平街、长沙世界之窗、湖南省博物馆、IFS国金中心",
-        "青岛": "栈桥、八大关、崂山、五四广场、青岛啤酒博物馆、金沙滩",
-    }
-    return mock.get(city, f"{city}：暂无推荐景点（示例）")
-
-
-@tool
-def recommend_food(city: str) -> str:
-    """美食推荐工具。当用户想了解某个城市好吃的美食、小吃时使用。
-    入参 city 为城市名，例如 '上海'。"""
-    mock = {
-        "北京": "北京烤鸭、炸酱面、卤煮火烧、豆汁儿、驴打滚、涮羊肉",
-        "上海": "小笼包、生煎、南翔馒头、蟹壳黄、排骨年糕、白斩鸡",
-        "广州": "白切鸡、虾饺、肠粉、艇仔粥、广式早茶、烧鹅",
-        "深圳": "沙井蚝、潮汕牛肉火锅、烧腊、肠粉、光明乳鸽、客家盆菜",
-        "杭州": "西湖醋鱼、东坡肉、龙井虾仁、片儿川、定胜糕、葱包桧",
-        "成都": "麻辣火锅、串串香、担担面、龙抄手、夫妻肺片、钟水饺",
-        "重庆": "重庆火锅、重庆小面、酸辣粉、毛血旺、辣子鸡、烤鱼",
-        "武汉": "热干面、三鲜豆皮、鸭脖、排骨藕汤、面窝、糊汤粉",
-        "西安": "羊肉泡馍、肉夹馍、凉皮、biangbiang面、葫芦头、甑糕",
-        "南京": "盐水鸭、鸭血粉丝汤、鸡鸣汤包、皮肚面、桂花糕、牛肉锅贴",
-        "天津": "狗不理包子、煎饼馃子、耳朵眼炸糕、十八街麻花、锅巴菜、老豆腐",
-        "苏州": "松鼠鳜鱼、苏式汤面、阳澄湖大闸蟹、生煎、桂花糖藕、奥灶面",
-        "长沙": "臭豆腐、糖油粑粑、口味虾、剁椒鱼头、长沙米粉、糖油坨坨",
-        "青岛": "辣炒蛤蜊、鲅鱼饺子、原壳鲍鱼、青岛啤酒、排骨米饭、海菜凉粉",
-    }
-    return mock.get(city, f"{city}：暂无美食推荐（示例）")
-
-
-@tool
-def word_count(text: str) -> str:
-    """字符统计工具。当用户询问某段文本的字符数、字数或长度时使用。
-    入参 text 为待统计的文本。"""
-    return f"字符数: {len(text)}"
-
-
-# ==================== Shell 命令 + 危险命令确认 ====================
-
-# 命中即视为危险命令，需向用户确认后才可执行
-DANGEROUS_COMMAND_PATTERNS = [
-    r"\brm\b",        # 删除文件/目录
-    r"\brmdir\b",
-    r"\bchown\b",     # 修改属主
-    r"\bchmod\b",     # 修改权限
-    r"\bmkfs\b",      # 格式化
-    r"\bdd\b",        # 磁盘写入
-    r"\bmv\b",        # 移动/覆盖
-    r"\bshutdown\b",
-    r"\breboot\b",
-    r"\bkill\b",
-    r"\bkillall\b",
-    r"\bformat\b",
-    r"\bdel\b",
-    r"\breg\s+delete\b",
-    r">\s*/dev/",
-    r":\(\)\s*\{",    # fork bomb
-]
-
-
-def _match_dangerous_command(command: str) -> Optional[str]:
-    """若命令命中危险模式，返回命中的模式，否则返回 None。"""
-    for pattern in DANGEROUS_COMMAND_PATTERNS:
-        if re.search(pattern, command):
-            return pattern
-    return None
-
-
-def _confirm_dangerous_command(command: str, pattern: str) -> bool:
-    """危险命令确认：用户输入 y/yes 表示同意执行，其它视为拒绝。"""
-    print(f"\n⚠  [危险命令] 检测到疑似危险操作（匹配 {pattern}）：")
-    print(f"     {command}")
-    try:
-        answer = input("     是否执行？同意请输入 y，拒绝直接回车 (y/N): ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    approved = answer in ("y", "yes")
-    print(f"     [危险命令] 用户{'已同意' if approved else '已拒绝'}执行。")
-    return approved
-
-
-@tool
-def run_command(command: str) -> str:
-    """执行 Shell 命令并返回输出（stdout/stderr 与退出码）。
-    对于危险命令（如 rm、chown、chmod、dd、mkfs、kill、shutdown 等），
-    会先向用户确认：用户同意才执行，拒绝则取消。入参 command 为要执行的命令。"""
-    pattern = _match_dangerous_command(command)
-    if pattern and not _confirm_dangerous_command(command, pattern):
-        return f"用户拒绝执行危险命令，已取消: {command}"
-
-    try:
-        proc = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        return f"命令执行超时（>60s）: {command}"
-    except Exception as exc:  # noqa: BLE001
-        return f"命令执行失败: {exc}"
-
-    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    return f"exit_code={proc.returncode}\n{output[:2000]}"
-
-
-BASE_TOOLS = [
-    calculator, get_weather, recommend_attractions, recommend_food,
-    word_count, run_command,
-]
+# ==================== 工具 ====================
+# 基础工具定义在 src/tool.py，危险命令执行在 src/dangerous.py，
+# 统一通过 BASE_TOOLS 导入（见上方 import）。
 
 
 # ==================== 消息打印（严格按时间顺序） ====================
@@ -341,24 +197,6 @@ def _make_skill_tool(skill: dict) -> StructuredTool:
 
 SKILL_TOOLS = [_make_skill_tool(s) for s in SKILLS]
 
-
-# ==================== 子 Agent（基于 deepagents 三方件） ====================
-
-# deepagents 会自动注入一个 task(task, subagent_type) 工具供主 Agent 开启子 Agent
-DEEP_SUBAGENTS = [
-    SubAgent(
-        name="research",
-        description=(
-            "研究与调研子智能体。当任务可以被拆分为独立的调研/查询子任务，"
-            "或某一子任务需要单独处理时，交由该子智能体完成。"
-        ),
-        system_prompt=(
-            "你是一个子智能体（research），负责完成主 Agent 交给你的子任务。"
-            "请使用可用工具完成任务，聚焦、简洁，最后给出明确的结论。"
-        ),
-        tools=BASE_TOOLS,
-    ),
-]
 
 # 主 Agent 可用的全部工具 = 基础工具 + 技能工具（task 子 Agent 工具由 deepagents 注入）
 TOOLS = BASE_TOOLS + SKILL_TOOLS

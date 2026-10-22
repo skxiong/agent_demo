@@ -1,0 +1,18 @@
+# agent_demo 项目依赖
+# 生成环境：Python 3.12（agent_env）
+# 安装：pip install -r requirements.txt
+
+# ---- Agent / LLM 框架 ----
+deepagents==0.6.12
+langchain==1.3.13
+langchain-core==1.6.0
+langchain-openai==1.6.0
+langchain-ollama==1.1.0
+
+# ---- 可观测性 / 追踪 ----
+langfuse==5.0.1
+opentelemetry-api==1.45.1
+
+# ---- 工具库 ----
+requests==2.32.5
+PyYAML==6.0.3
