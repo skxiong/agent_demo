@@ -7,7 +7,7 @@ ReAct 范式：Reasoning + Acting
   - 调用工具后拿到观察结果（Observation），再继续推理
   - 直到 LLM 认为可以直接给出最终答案（Final Answer）
 
-本文件用 LangGraph 的 create_react_agent 构建一个最简 ReAct 智能体，
+本文件用 deepagents 的 create_deep_agent 构建一个 ReAct 智能体（LangGraph 之上），
 并通过 LangFuse 记录整条链路：Agent 节点、LLM generation、Tool 调用。
 
 Skill（技能）支持：
@@ -16,6 +16,12 @@ Skill（技能）支持：
   - 当用户问题与某技能描述相似时，智能体先调用该技能工具获取步骤，
     再严格按步骤依次执行（示例技能 tool_calling 会依次调用
     calculator -> get_weather -> recommend_attractions -> recommend_food -> word_count）
+
+子 Agent（Sub-Agent）支持（基于 deepagents 三方件）：
+  - 主 Agent 由 deepagents.create_deep_agent 构建
+  - 通过 subagents=[SubAgent(...)] 定义子 Agent，deepagents 自动注入 task 工具
+  - 主 Agent 调用 task(description, subagent_type) 即可开启子 Agent
+  - 子 Agent 执行链路同样由 LangFuse 记录
 
 LangFuse 追踪方式：
   - @observe 装饰器：把整次 agent 调用包装成一个 chain span
@@ -43,10 +49,10 @@ for attr in ('verbose', 'debug', 'llm_cache'):
 
 import yaml
 
-# ========== LangChain / LangGraph ==========
+# ========== LangChain / LangGraph / deepagents ==========
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool, StructuredTool
-from langgraph.prebuilt import create_react_agent
+from deepagents import create_deep_agent, SubAgent
 
 # LangFuse 导入
 from langfuse import observe, get_client
@@ -75,11 +81,14 @@ LANGFUSE_ENABLED = bool(
 )
 
 # 使用 ChatOpenAI，可兼容 OpenAI / 通义 / DeepSeek 等 OpenAI‑兼容接口
+# model_kwargs 中关闭并行工具调用：保证同一时刻只调用一个工具，
+# 使「模型决策 -> 工具调用 -> 工具返回」严格按时间顺序逐一打印
 llm = ChatOpenAI(
     model="qwen3.8-27b",
     api_key=os.getenv("OPENAI_API_KEY"),
     base_url=os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
     temperature=0,
+    model_kwargs={"parallel_tool_calls": False},
 )
 
 
@@ -171,7 +180,26 @@ def word_count(text: str) -> str:
     return f"字符数: {len(text)}"
 
 
-TOOLS = [calculator, get_weather, recommend_attractions, recommend_food, word_count]
+BASE_TOOLS = [calculator, get_weather, recommend_attractions, recommend_food, word_count]
+
+
+# ==================== 消息打印（严格按时间顺序） ====================
+
+def _print_message(msg, prefix: str = "") -> None:
+    """按消息类型打印：模型交互内容 / 模型决策(工具或命令) / 工具调用 / 工具返回。"""
+    kind = type(msg).__name__
+    if kind == "AIMessage":
+        content = getattr(msg, "content", "")
+        if content:
+            print(f"{prefix}[模型] {content}")
+        for call in (getattr(msg, "tool_calls", None) or []):
+            name = call["name"]
+            args = call.get("args", {})
+            # 模型决定要调用的工具 / 要执行的命令
+            print(f"{prefix}[模型] 决定调用工具 {name}，参数: {args}")
+            print(f"{prefix}[工具调用] {name}  参数: {args}")
+    elif kind == "ToolMessage":
+        print(f"{prefix}[工具返回] {msg.name}: {msg.content}")
 
 
 # ==================== Skill 加载（读取同级 skill 目录） ====================
@@ -233,8 +261,27 @@ def _make_skill_tool(skill: dict) -> StructuredTool:
 
 SKILL_TOOLS = [_make_skill_tool(s) for s in SKILLS]
 
-# 智能体可用的全部工具 = 基础工具 + 技能工具
-TOOLS = TOOLS + SKILL_TOOLS
+
+# ==================== 子 Agent（基于 deepagents 三方件） ====================
+
+# deepagents 会自动注入一个 task(task, subagent_type) 工具供主 Agent 开启子 Agent
+DEEP_SUBAGENTS = [
+    SubAgent(
+        name="research",
+        description=(
+            "研究与调研子智能体。当任务可以被拆分为独立的调研/查询子任务，"
+            "或某一子任务需要单独处理时，交由该子智能体完成。"
+        ),
+        system_prompt=(
+            "你是一个子智能体（research），负责完成主 Agent 交给你的子任务。"
+            "请使用可用工具完成任务，聚焦、简洁，最后给出明确的结论。"
+        ),
+        tools=BASE_TOOLS,
+    ),
+]
+
+# 主 Agent 可用的全部工具 = 基础工具 + 技能工具（task 子 Agent 工具由 deepagents 注入）
+TOOLS = BASE_TOOLS + SKILL_TOOLS
 
 _SKILL_CATALOG = "\n".join(
     f"   - {s['name']}（skill_{s['name']}）：{s['description']}" for s in SKILLS
@@ -254,41 +301,27 @@ SYSTEM_PROMPT = (
     "   - 推荐城市美食 / 小吃 -> recommend_food\n"
     "   - 统计文本字符数 / 字数 / 长度 -> word_count\n"
     "4. 调用工具后根据返回结果（Observation）继续推理。\n"
-    "5. 当可以确定答案时，输出最终答案（Final Answer）。"
+    "5. 你还可以开启子 Agent（deepagents 能力）：当任务可拆分为独立子任务、"
+    "或某部分需要专门处理时，调用 task(description=\"...\", subagent_type=\"research\") "
+    "由子 Agent 完成子任务并返回结论。\n"
+    "6. 当可以确定答案时，输出最终答案（Final Answer）。"
 )
 
-# ==================== 构建 ReAct 智能体 ====================
+# ==================== 构建 ReAct 智能体（deepagents） ====================
 
-# 关闭并行工具调用：保证同一时刻只调用一个工具，
-# 从而使「工具调用 -> 工具返回」严格按时间顺序逐一打印
-model_with_tools = llm.bind_tools(TOOLS, parallel_tool_calls=False)
-
-agent = create_react_agent(
-    model_with_tools,
-    TOOLS,
-    prompt=SYSTEM_PROMPT,
-    name="react_agent",
+# 使用 deepagents 的 create_deep_agent 构建主 Agent：
+#   - 自带规划(file/todo)等中间件
+#   - 通过 subagents 注入子 Agent，并自动提供 task 工具用于开启子 Agent
+agent = create_deep_agent(
+    model=llm,
+    tools=TOOLS,
+    system_prompt=SYSTEM_PROMPT,
+    subagents=DEEP_SUBAGENTS,
+    name="deep_main_agent",
 )
 
 
 # ==================== LangFuse 追踪（核心） ====================
-
-def _print_message(msg) -> None:
-    """按消息类型打印：模型交互内容 / 模型决策(工具或命令) / 工具调用 / 工具返回。"""
-    kind = type(msg).__name__
-    if kind == "AIMessage":
-        content = getattr(msg, "content", "")
-        if content:
-            print(f"[模型] {content}")
-        for call in (getattr(msg, "tool_calls", None) or []):
-            name = call["name"]
-            args = call.get("args", {})
-            # 模型决定要调用的工具 / 要执行的命令
-            print(f"[模型] 决定调用工具 {name}，参数: {args}")
-            print(f"[工具调用] {name}  参数: {args}")
-    elif kind == "ToolMessage":
-        print(f"[工具返回] {msg.name}: {msg.content}")
-
 
 @observe(name="react_agent_invoke", as_type="chain")
 def run_agent(
@@ -346,6 +379,7 @@ def demo_react_agent():
     print("输入 exit / quit 或直接回车退出，任何时候按 Ctrl+C 也可退出。")
     if SKILLS:
         print("已加载技能: " + ", ".join(s["name"] for s in SKILLS))
+    print("可用子 Agent 类型: " + ", ".join(s["name"] for s in DEEP_SUBAGENTS) + "（deepagents 自动提供 task 工具）")
     print()
 
     session_id = f"session-{uuid.uuid4().hex[:8]}"
