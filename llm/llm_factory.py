@@ -6,7 +6,7 @@ def find_env_file():
     """
     查找.env文件
     1. 优先：当前脚本运行工作目录下查找 .env
-    2. 没找到：向上一层，项目根目录（tests上级）查找 .env
+    2. 没找到：向上一层，项目根目录（llm上级，即 agent_demo）查找 .env
     返回.env绝对路径；找不到返回None
     """
     # 1. 当前工作目录
@@ -14,11 +14,11 @@ def find_env_file():
     if os.path.isfile(cwd_env):
         return cwd_env
 
-    # 2. 当前脚本所在tests目录，往上到项目根目录
-    tests_file = os.path.abspath(__file__)
-    tests_dir = os.path.dirname(tests_file)
-    project_root = os.path.dirname(tests_dir)
-    project_env = os.path.join(project_root, "src", ".env")
+    # 2. 当前脚本所在 llm 目录，往上到项目根目录 agent_demo
+    this_file = os.path.abspath(__file__)
+    this_dir = os.path.dirname(this_file)
+    project_root = os.path.dirname(this_dir)
+    project_env = os.path.join(project_root, ".env")
     if os.path.isfile(project_env):
         return project_env
 

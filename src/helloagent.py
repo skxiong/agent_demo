@@ -11,7 +11,7 @@ ReAct 范式：Reasoning + Acting
 并通过 LangFuse 记录整条链路：Agent 节点、LLM generation、Tool 调用。
 
 Skill（技能）支持：
-  - 从同级 skill 目录读取 <skill>/SKILL.md（YAML frontmatter: name/description）
+  - 从项目根目录的 skill 目录读取 <skill>/SKILL.md（YAML frontmatter: name/description）
   - 每个技能注册为一个工具，description 用于匹配用户问题
   - 当用户问题与某技能描述相似时，智能体先调用该技能工具获取步骤，
     再严格按步骤依次执行（示例技能 tool_calling 会依次调用
@@ -29,7 +29,7 @@ LangFuse 追踪方式：
     LLM 调用与工具调用，并挂载到当前 @observe 的 trace 上
   - OpenTelemetry span 属性：注入 user_id / session_id / tags
 
-环境变量配置（Windows PowerShell），或写入同目录 .env：
+环境变量配置（Windows PowerShell），或写入项目根目录（agent_demo）的 .env：
   OPENAI_API_KEY / OPENAI_BASE_URL
   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL
 """
@@ -58,8 +58,11 @@ from deepagents import create_deep_agent, SubAgent
 from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
 
-# 从当前文件同级目录的 .env 读取配置到环境变量
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+# 项目根目录（src 的上一级，即 agent_demo）
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 从项目根目录的 .env 读取配置到环境变量
+_env_path = os.path.join(PROJECT_ROOT, ".env")
 if os.path.exists(_env_path):
     with open(_env_path, encoding="utf-8") as _f:
         for _line in _f:
@@ -202,9 +205,9 @@ def _print_message(msg, prefix: str = "") -> None:
         print(f"{prefix}[工具返回] {msg.name}: {msg.content}")
 
 
-# ==================== Skill 加载（读取同级 skill 目录） ====================
+# ==================== Skill 加载（读取项目根目录 skill 目录） ====================
 
-SKILL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skill")
+SKILL_DIR = os.path.join(PROJECT_ROOT, "skill")
 
 
 def _parse_skill_md(text: str):

@@ -1,6 +1,6 @@
 import os
 import requests
-from src.llm_factory import load_env_file, find_env_file # 导入src读取.env函数
+from llm.llm_factory import load_env_file, find_env_file  # 导入读取.env的函数
 
 
 def chat_request(base_url: str, api_key: str, model_name: str, user_content: str, timeout=120):
